@@ -96,6 +96,11 @@ module Fluent
         host = e['host']
         port = e['port']
         port = port ? port.to_i : DEFAULT_LISTEN_PORT
+        
+        hb_host = e['heartbeat_host']
+        hb_port = e['heartbeat_port']
+        hb_host = hb_host ? hb_host : host
+        hb_port = hb_port ? hb_port : port
 
         weight = e['weight']
         weight = weight ? weight.to_i : 60
@@ -109,7 +114,7 @@ module Fluent
 
         failure = FailureDetector.new(@heartbeat_interval, @hard_timeout, Time.now.to_i.to_f)
 
-        node_conf = NodeConfig.new(name, host, port, weight, standby, failure,
+        node_conf = NodeConfig.new(name, host, port, hb_host, hb_port, weight, standby, failure,
           @phi_threshold, recover_sample_size, @expire_dns_cache, @phi_failure_detector)
         @nodes << Node.new(log, node_conf)
         log.info "adding forwarding server '#{name}'", :host=>host, :port=>port, :weight=>weight, :plugin_id=>plugin_id
@@ -127,7 +132,7 @@ module Fluent
 
       if @heartbeat_type == :udp
         # assuming all hosts use udp
-        @usock = SocketUtil.create_udp_socket(@nodes.first.host)
+        @usock = SocketUtil.create_udp_socket(@nodes.first.hb_host)
         @usock.fcntl(Fcntl::F_SETFL, Fcntl::O_NONBLOCK)
         @hb = HeartbeatHandler.new(@usock, method(:on_heartbeat))
         @loop.attach(@hb)
@@ -334,7 +339,7 @@ module Fluent
 
     def connect(node)
       # TODO unix socket?
-      TCPSocket.new(node.resolved_host, node.port)
+      TCPSocket.new(node.resolved_hb_host, node.hb_port)
     end
 
     class HeartbeatRequestTimer < Coolio::TimerWatcher
@@ -357,15 +362,15 @@ module Fluent
           rebuild_weight_array
         end
         begin
-          #log.trace "sending heartbeat #{n.host}:#{n.port} on #{@heartbeat_type}"
+          #log.trace "sending heartbeat #{n.hb_host}:#{n.hb_port} on #{@heartbeat_type}"
           if @heartbeat_type == :tcp
             send_heartbeat_tcp(n)
           else
-            @usock.send "\0", 0, Socket.pack_sockaddr_in(n.port, n.resolved_host)
+            @usock.send "\0", 0, Socket.pack_sockaddr_in(n.hb_port, n.resolved_hb_host)
           end
         rescue Errno::EAGAIN, Errno::EWOULDBLOCK, Errno::EINTR, Errno::ECONNREFUSED
           # TODO log
-          log.debug "failed to send heartbeat packet to #{n.host}:#{n.port}", :error=>$!.to_s
+          log.debug "failed to send heartbeat packet to #{n.hb_host}:#{n.hb_port}", :error=>$!.to_s
         end
       }
     end
@@ -395,15 +400,15 @@ module Fluent
     def on_heartbeat(sockaddr, msg)
       port, host = Socket.unpack_sockaddr_in(sockaddr)
       if node = @nodes.find {|n| n.sockaddr == sockaddr }
-        #log.trace "heartbeat from '#{node.name}'", :host=>node.host, :port=>node.port
+        #log.trace "heartbeat from '#{node.name}'", :host=>node.hb_host, :port=>node.hb_port
         if node.heartbeat
           rebuild_weight_array
         end
       end
     end
 
-    NodeConfig = Struct.new("NodeConfig", :name, :host, :port, :weight, :standby, :failure,
-      :phi_threshold, :recover_sample_size, :expire_dns_cache, :phi_failure_detector)
+    NodeConfig = Struct.new("NodeConfig", :name, :host, :port, :hb_host, :hb_port, :weight, 
+      :standby, :failure, :phi_threshold, :recover_sample_size, :expire_dns_cache, :phi_failure_detector)
 
     class Node
       def initialize(log, conf)
@@ -412,17 +417,25 @@ module Fluent
         @name = @conf.name
         @host = @conf.host
         @port = @conf.port
+        @hb_host = @conf.hb_host
+        @hb_port = @conf.hb_port
         @weight = @conf.weight
         @failure = @conf.failure
         @available = true
 
         @resolved_host = nil
+        @resolved_hb_host = nil
         @resolved_time = 0
-        resolved_host  # check dns
+        @resolved_host = resolved_host(@port, @host, nil)  # check dns
+        if @host != @hb_host || @port != @hb_port
+          @resolved_hb_host =resolved_host(@hb_port, @hb_host, nil)
+        else
+          @resolved_hb_host = @resolved_host
+        end
       end
 
       attr_reader :conf
-      attr_reader :name, :host, :port, :weight
+      attr_reader :name, :host, :port, :hb_name, :hb_port, :weight
       attr_reader :sockaddr  # used by on_heartbeat
       attr_reader :failure, :available # for test
 
@@ -438,32 +451,33 @@ module Fluent
         @conf.standby
       end
 
-      def resolved_host
+      def resolved_host(port, host, resolved_host)
         case @conf.expire_dns_cache
         when 0
           # cache is disabled
-          return resolve_dns!
+          return resolve_dns!(port, host)
 
         when nil
           # persistent cache
-          return @resolved_host ||= resolve_dns!
+          return resolved_host ||= resolve_dns!(port, host)
 
         else
           now = Engine.now
-          rh = @resolved_host
+          rh = resolved_host
           if !rh || now - @resolved_time >= @conf.expire_dns_cache
-            rh = @resolved_host = resolve_dns!
+            rh = resolve_dns!(port, host)
             @resolved_time = now
           end
           return rh
         end
       end
 
-      def resolve_dns!
-        @sockaddr = Socket.pack_sockaddr_in(@port, @host)
+      def resolve_dns!(port, host)
+        @sockaddr = Socket.pack_sockaddr_in(port, host)
         port, resolved_host = Socket.unpack_sockaddr_in(@sockaddr)
         return resolved_host
       end
+      
       private :resolve_dns!
 
       def tick
@@ -479,6 +493,7 @@ module Fluent
           @log.warn "detached forwarding server '#{@name}'", :host=>@host, :port=>@port, :hard_timeout=>true
           @available = false
           @resolved_host = nil  # expire cached host
+          @resolved_hb_host =nil
           @failure.clear
           return true
         end
@@ -490,6 +505,7 @@ module Fluent
             @log.warn "detached forwarding server '#{@name}'", :host=>@host, :port=>@port, :phi=>phi
             @available = false
             @resolved_host = nil  # expire cached host
+            @resolved_hb_host = nil
             @failure.clear
             return true
           end
