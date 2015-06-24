@@ -431,9 +431,9 @@ module Fluent
         @resolved_host = nil
         @resolved_hb_host = nil
         @resolved_time = 0
-        @resolved_host = resolved_host(@port, @host, nil)  # check dns
+        @resolved_host = resolved_host  # check dns
         if @host != @hb_host || @port != @hb_port
-          @resolved_hb_host = resolved_host(@hb_port, @hb_host, nil)
+          @resolved_hb_host = resolved_hb_host
         else
           @resolved_hb_host = @resolved_host
         end
@@ -456,7 +456,15 @@ module Fluent
         @conf.standby
       end
 
-      def resolved_host(port, host, resolved_host)
+      def resolved_host
+        return resolved_host_impl(@port, @host, @resolved_host)
+      end
+
+      def resolved_hb_host
+        return resolved_host_impl(@hb_port, @hb_host, @resolved_hb_host)
+      end
+
+      def resolved_host_impl(port, host, resolved_host)
         case @conf.expire_dns_cache
         when 0
           # cache is disabled
