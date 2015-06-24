@@ -100,7 +100,7 @@ module Fluent
         hb_host = e['heartbeat_host']
         hb_port = e['heartbeat_port']
         hb_host = hb_host ? hb_host : host
-        hb_port = hb_port ? hb_port : port
+        hb_port = hb_port ? hb_port.to_i : port
 
         weight = e['weight']
         weight = weight ? weight.to_i : 60
@@ -245,7 +245,7 @@ module Fluent
 
     #FORWARD_TCP_HEARTBEAT_DATA = FORWARD_HEADER + ''.to_msgpack + [].to_msgpack
     def send_heartbeat_tcp(node)
-      sock = connect(node)
+      sock = connect_hb(node)
       begin
         opt = [1, @send_timeout.to_i].pack('I!I!')  # { int l_onoff; int l_linger; }
         sock.setsockopt(Socket::SOL_SOCKET, Socket::SO_LINGER, opt)
@@ -339,6 +339,11 @@ module Fluent
 
     def connect(node)
       # TODO unix socket?
+      TCPSocket.new(node.resolved_host, node.port)
+    end
+
+    def connect_hb(node)
+      # TODO unix socket?
       TCPSocket.new(node.resolved_hb_host, node.hb_port)
     end
 
@@ -428,7 +433,7 @@ module Fluent
         @resolved_time = 0
         @resolved_host = resolved_host(@port, @host, nil)  # check dns
         if @host != @hb_host || @port != @hb_port
-          @resolved_hb_host =resolved_host(@hb_port, @hb_host, nil)
+          @resolved_hb_host = resolved_host(@hb_port, @hb_host, nil)
         else
           @resolved_hb_host = @resolved_host
         end
@@ -493,7 +498,7 @@ module Fluent
           @log.warn "detached forwarding server '#{@name}'", :host=>@host, :port=>@port, :hard_timeout=>true
           @available = false
           @resolved_host = nil  # expire cached host
-          @resolved_hb_host =nil
+          @resolved_hb_host = nil
           @failure.clear
           return true
         end
